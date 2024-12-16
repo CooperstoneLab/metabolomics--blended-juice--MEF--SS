@@ -1,0 +1,1083 @@
+---
+title: "Metabolomics - Neg Data - MEF - Statistical analyses - Part II"
+author: "Giovana Domeneghini Mercali"
+prefer-html: true
+format: gfm
+---
+
+# Load libraries
+```{r, message = FALSE, warning = FALSE}
+library(factoextra) # visualizing PCA results
+library(glue) # for easy pasting
+library(plotly) # quick interactive plots
+library(proxyC) # more efficient large matrices
+library(data.table) # easy transposing
+library(janitor) # for cleaning names and checking duplicates
+library(notame) # for collapsing ions coming from the same metabolite
+library(doParallel) # for parallelizing notame specifically
+library(patchwork) # for making multi-panel plots
+library(readxl)
+library(svglite)
+library(pheatmap) # for heínsatmaps
+library(ggridges) # for ridgeline plots
+library(ggdist) # for nice dotplots
+library(rstatix) # for pipeable stats testing
+library(agricolae) # for posthoc tests 
+library(ggpubr) # extension for adding stats to plots
+library(rcompanion)
+library(purrr)
+library(multcompView) # Load the multcompView package for comparison letters
+
+# this is at the end hoping that the default select will be that from dplyr
+library(tidyverse) # for everything
+```
+
+# Read in data
+
+Negative mode.
+
+```{r}
+# read in metabolomics data
+
+feature_table_long_log2 <- read_csv("feature_table_long_log2__annotated_neg.csv",
+                  trim_ws = TRUE) 
+
+# read in meta data
+metadata <- read_csv("metadata_neg_mef.csv",
+                  trim_ws = TRUE)
+
+# read in meta data
+annotation <- read_csv("Annotation_neg.csv", 
+                  locale=locale(encoding = "latin1"))
+
+```
+# Compariosn between compounds A
+
+## Boxplots
+
+Filter to select the compound you want to plot.
+
+```{r}
+compound_A <- feature_table_long_log2 %>%
+  filter(id == "3,4-Dihydroxybenzoic acid" | id == "Gallic acid" | id == "Ferulic acid" | id == "Caffeic acid" | id =="2,4,6-Trihydroxybenzoic acid" | id == "Ellagic acid") %>%
+   filter(sample_or_qc == "Sample")
+
+```
+
+
+Then plot.
+
+```{r}
+boxplot_compound_A <- compound_A %>%
+  ggplot(aes(x = factor(treatment, levels = c("FJ", "MT", "MEF", "MEF+SS")), 
+             y = rel_abund, fill = treatment)) +
+  geom_boxplot(color = "black", alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(height = 0, width = 0.3) +
+  facet_wrap(vars(id), nrow = 2, scales = "free_y") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("FJ" = "#F28EAD", 
+                                "MT" = "#C77CDB",
+                                "MEF" = "#A8D8B9", 
+                                "MEF+SS" = "#7FB3D5")) +
+  labs(x = "Treatment",
+  y = "log2(relative abundance)",
+  title = "")
+
+boxplot_compound_A
+
+
+```
+
+
+
+## Testing assumptions
+
+### Normality
+
+
+```{r}
+# testing normality by group
+compound_A %>%
+  drop_na(rel_abund) %>% # remove NAs
+  group_by(id) %>% # test by species
+  shapiro_test(rel_abund) # test for normality
+```
+
+### Constant variance
+
+```{r}
+# testing constant variance
+
+compound_A %>%
+  drop_na(rel_abund) %>% # remove NAs
+  levene_test(rel_abund ~ id) # test for constant variance
+```
+
+```{r}
+compound_A %>%
+  drop_na(rel_abund) %>%
+  ggplot(aes(x = rel_abund, y = id, fill = id)) +
+  ggridges::geom_density_ridges(alpha = 0.7) +
+  # scale_y_discrete(labels = c("3,4-Dihydroxybenzoic acid", "Gallic acid", "Ferulic acid", "Caffeic acid", "2,4,6-Trihydroxybenzoic acid", "Ellagic acid")) +
+  theme_minimal() +  
+  theme(legend.position = "none") +
+  labs(x = "Relative abundance",
+       y = "Compound",
+       title = "Distribution of relative abundace for some compounds in blended juice")
+```
+
+
+Find which features have no variance across treatments
+
+```{r}
+treatments_novariance <- compound_A %>%
+  group_by(id) %>%
+  summarize(stdev = sd(rel_abund),
+            mean = mean(rel_abund)) %>%
+  filter(stdev == 0)
+
+```
+
+No features with zero variance.
+
+
+## Nonparametric tests
+
+### kruskal Wallis test
+
+```{r}
+kruskal_compound_A <- compound_A %>%
+  drop_na(rel_abund, treatment) %>%            # Remove NA values first
+  group_by(id) %>%                             # Group by 'id'
+  kruskal_test(rel_abund ~ treatment) %>%      # Apply the Kruskal-Wallis test
+  add_significance() %>%     
+  arrange(p)     
+           
+kruskal_compound_A
+```
+
+
+### Post-hoc test
+
+Run Dunn test
+
+```{r}
+(kruskal_compound_A_posthoc <- compound_A %>%
+      drop_na(rel_abund, treatment) %>%        # Remove NA values first
+      group_by(id) %>%                         # Group by 'id'
+      dunn_test(rel_abund ~ treatment,
+                p.adjust.method = "BH"))
+```
+
+```{r}
+# Create a column called comparison
+
+kruskal_compound_A_posthocc_1 <- kruskal_compound_A_posthoc %>%
+  mutate(comparison = glue("{group1} - {group2}")) 
+  
+# Group data by 'id' and create a nested data frame
+group_cldList <- kruskal_compound_A_posthocc_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(p.adj ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+# Display the result
+group_cldList <- group_cldList %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+  
+```
+
+
+Make a table that has the maximum relative abundance for each treatment.
+
+```{r}
+# Calculate maximum rel_abund for each id and treatment
+max_relabund <- compound_A %>%
+  drop_na(rel_abund, treatment) %>%  # Remove NA values
+  group_by(id, treatment) %>%        # Group by 'id' and 'treatment'
+  summarize(max_tot_relabund = max(rel_abund, na.rm = TRUE)) %>%  # Calculate max
+  ungroup()  # Remove grouping
+
+# Display the result
+max_relabund
+```
+
+
+Bind the groups to the maximum relative abundance.
+
+```{r}
+dunn_compound_A_for_plotting <- max_relabund %>%
+  left_join(group_cldList, by = c("id", "treatment"))
+
+```
+
+
+Plot
+
+```{r}
+boxplot_dunn <- boxplot_compound_A +
+  geom_text(data = dunn_compound_A_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = dunn_compound_A_for_plotting$Letter)) +
+  labs(caption = "For each compound, treatmnets with different letters are significant different unsing Krushal Wallis test")
+
+boxplot_dunn 
+```
+
+## Parametric tests
+
+### ANOVA test
+
+```{r}
+# Prepare your data 
+clean_data <- compound_A %>%
+  drop_na(rel_abund, treatment) %>%
+  group_by(id) %>%
+  nest()  # Nest data for each 'id'
+
+# Apply ANOVA to each nested data frame
+results <- clean_data %>%
+  mutate(
+    anova_model = map(data, ~ aov(rel_abund ~ treatment, data = .x)),
+    anova_summary = map(anova_model, tidy)  # Use broom::tidy to summarize ANOVA results
+  )
+
+# Print results for each id
+results %>%
+  select(id, anova_summary) %>%
+  unnest(anova_summary) %>%
+  print()
+
+# To perform Tukey HSD test and print results
+results <- results %>%
+  mutate(
+    tukey_test = map(anova_model, TukeyHSD),
+    tukey_summary = map(tukey_test, tidy)  # Use broom::tidy to summarize Tukey HSD results
+  )
+
+# Print Tukey HSD results
+table_results <- results %>%
+  select(id, tukey_summary) %>%
+  unnest(tukey_summary) %>%
+  arrange(adj.p.value)%>%
+  print()
+```
+
+```{r}
+# Create a column called comparison
+
+table_results_1 <- table_results %>%
+rename(comparison = `contrast`)
+
+# Group data by 'id' and create a nested data frame
+group_cldList_2 <- table_results_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(adj.p.value ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+
+# Display the result
+group_cldList_2 <- group_cldList_2 %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+
+```
+
+Join the groups to the maximum relative abundance.
+
+```{r}
+tukey_compound_A_for_plotting <- max_relabund %>%
+  left_join(group_cldList_2, by = c("id", "treatment"))
+```
+
+```{r}
+Boxplot_tukey_compound_A <- boxplot_compound_A +
+  geom_text(data = tukey_compound_A_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = Letter)) +
+  labs(title = "", tag = "D")
+
+Boxplot_tukey_compound_A
+
+```
+
+```{r}
+ggsave(plot = Boxplot_tukey_compound_A,
+       filename = "boxplot_compound_A_neg.svg")
+```
+
+
+# Compariosn between compounds B
+
+## Boxplots
+
+Filter to select the compound you want to plot.
+
+```{r}
+compound_B <- feature_table_long_log2 %>%
+  filter(id == "Epicatechin" |  id == "Procyanidin B2" | id == "Procyanidin C1" | id == "Phloretin" |id =="Phlorhizin" | id == "Quercitrin") %>%
+   filter(sample_or_qc == "Sample")
+
+```
+
+
+Then plot.
+
+```{r}
+boxplot_compound_B <- compound_B %>%
+  ggplot(aes(x = factor(treatment, levels = c("FJ", "MT", "MEF", "MEF+SS")), 
+             y = rel_abund, fill = treatment)) +
+  geom_boxplot(color = "black", alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(height = 0, width = 0.3) +
+  facet_wrap(vars(id), nrow = 2, scales = "free_y") +
+  theme_classic() +
+  scale_fill_manual(values = c("FJ" = "#F28EAD", 
+                                "MT" = "#C77CDB",
+                                "MEF" = "#A8D8B9", 
+                                "MEF+SS" = "#7FB3D5")) +
+  theme(legend.position = "none") +
+  labs(x = "Treatment",
+  y = "log2(relative abundance)",
+  title = "")
+  
+
+```
+## Testing assumptions
+
+### Normality
+
+```{r}
+# testing normality by group
+compound_B %>%
+  drop_na(rel_abund) %>% # remove NAs
+  group_by(id) %>% # test by species
+  shapiro_test(rel_abund) # test for normality
+```
+### Constant variance
+
+```{r}
+# testing constant variance
+
+compound_B %>%
+  drop_na(rel_abund) %>% # remove NAs
+  levene_test(rel_abund ~ id) # test for constant variance
+```
+
+
+```{r}
+compound_B %>%
+  drop_na(rel_abund) %>%
+  ggplot(aes(x = rel_abund, y = id, fill = id)) +
+  ggridges::geom_density_ridges(alpha = 0.7) +
+  # scale_y_discrete(labels = c("Epicatechin", "Procyanidin B2", "Procyanidin C1", "Phloretin", "Phlorhizin", "Quercitrin")) +
+  theme_minimal() +  
+  theme(legend.position = "none") +
+  labs(x = "Relative abundance",
+       y = "Compound",
+       title = "Distribution of relative abundace for some compounds in blended juice")
+```
+
+## Nonparametric tests
+
+### kruskal Wallis test
+
+```{r}
+kruskal_compound_B <- compound_B %>%
+  drop_na(rel_abund, treatment) %>%            # Remove NA values first
+  group_by(id) %>%                             # Group by 'id'
+  kruskal_test(rel_abund ~ treatment) %>%      # Apply the Kruskal-Wallis test
+  add_significance() %>%     
+  arrange(p)     
+           
+kruskal_compound_B
+```
+
+### Post-hoc test
+
+Run Dunn test
+
+```{r}
+(kruskal_compound_B_posthoc <- compound_B %>%
+      drop_na(rel_abund, treatment) %>%        # Remove NA values first
+      group_by(id) %>%                         # Group by 'id'
+      dunn_test(rel_abund ~ treatment,
+                p.adjust.method = "BH"))
+```
+
+
+```{r}
+# Create a column called comparison
+
+kruskal_compound_B_posthocc_1 <- kruskal_compound_B_posthoc %>%
+  mutate(comparison = glue("{group1} - {group2}")) 
+  
+# Group data by 'id' and create a nested data frame
+group_cldList <- kruskal_compound_B_posthocc_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(p.adj ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+# Display the result
+group_cldList <- group_cldList %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+  
+```
+
+
+Make a table that has the maximum relative abundance for each treatment.
+
+```{r}
+# Calculate maximum rel_abund for each id and treatment
+max_relabund <- compound_B %>%
+  drop_na(rel_abund, treatment) %>%  # Remove NA values
+  group_by(id, treatment) %>%        # Group by 'id' and 'treatment'
+  summarize(max_tot_relabund = max(rel_abund, na.rm = TRUE)) %>%  # Calculate max
+  ungroup()  # Remove grouping
+
+# Display the result
+max_relabund
+```
+
+
+Bind the groups to the maximum relative abundance.
+
+```{r}
+dunn_compound_B_for_plotting <- max_relabund %>%
+  left_join(group_cldList, by = c("id", "treatment"))
+
+```
+
+Plot
+
+```{r}
+boxplot_dunn <- boxplot_compound_B +
+  geom_text(data = dunn_compound_B_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = dunn_compound_B_for_plotting$Letter)) +
+  labs(caption = "For each compound, treatmnets with different letters are significant different unsing Krushal Wallis test")
+
+boxplot_dunn 
+```
+
+
+## Parametric tests
+
+### ANOVA test
+
+```{r}
+# Prepare your data 
+clean_data <- compound_B %>%
+  drop_na(rel_abund, treatment) %>%
+  group_by(id) %>%
+  nest()  # Nest data for each 'id'
+
+# Apply ANOVA to each nested data frame
+results <- clean_data %>%
+  mutate(
+    anova_model = map(data, ~ aov(rel_abund ~ treatment, data = .x)),
+    anova_summary = map(anova_model, tidy)  # Use broom::tidy to summarize ANOVA results
+  )
+
+# Print results for each id
+results %>%
+  select(id, anova_summary) %>%
+  unnest(anova_summary) %>%
+  print()
+
+# To perform Tukey HSD test and print results
+results <- results %>%
+  mutate(
+    tukey_test = map(anova_model, TukeyHSD),
+    tukey_summary = map(tukey_test, tidy)  # Use broom::tidy to summarize Tukey HSD results
+  )
+
+# Print Tukey HSD results
+table_results <- results %>%
+  select(id, tukey_summary) %>%
+  unnest(tukey_summary) %>%
+  arrange(adj.p.value)%>%
+  print()
+```
+
+```{r}
+# Create a column called comparison
+
+table_results_1 <- table_results %>%
+rename(comparison = `contrast`)
+
+# Group data by 'id' and create a nested data frame
+group_cldList_2 <- table_results_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(adj.p.value ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+
+# Display the result
+group_cldList_2 <- group_cldList_2 %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+
+```
+
+Join the groups to the maximum relative abundance.
+
+```{r}
+tukey_compound_B_for_plotting <- max_relabund %>%
+  left_join(group_cldList_2, by = c("id", "treatment"))
+```
+
+```{r}
+Boxplot_tukey_compound_B <- boxplot_compound_B +
+  geom_text(data = tukey_compound_B_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = Letter)) +
+  labs(title = "", tag = "A")
+
+Boxplot_tukey_compound_B
+
+```
+```{r}
+ggsave(plot = Boxplot_tukey_compound_B,
+       filename = "boxplot_compound_B_neg.svg")
+```
+
+
+# Compariosn between compounds C
+
+## Boxplots
+
+Filter to select the compound you want to plot.
+
+```{r}
+compound_C <- feature_table_long_log2 %>%
+  filter(id == "Coumaroyl quinic acid" |  id == "Feruloylquinic acid" | id == "Quercetin-3-glucoside" | id == "Sinapic acid" |id =="5-Caffeoylquinic acid" | id == "Naringin") %>%
+   filter(sample_or_qc == "Sample")
+
+```
+
+
+Then plot.
+
+```{r}
+boxplot_compound_C <- compound_C %>%
+  ggplot(aes(x = factor(treatment, levels = c("FJ", "MT", "MEF", "MEF+SS")), 
+             y = rel_abund, fill = treatment)) +
+  geom_boxplot(color = "black", alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(height = 0, width = 0.3) +
+  facet_wrap(vars(id), nrow = 2, scales = "free_y") +
+  theme_classic() +
+  theme(legend.position = "none") +
+ scale_fill_manual(values = c("FJ" = "#F28EAD", 
+                                "MT" = "#C77CDB",
+                                "MEF" = "#A8D8B9", 
+                                "MEF+SS" = "#7FB3D5")) +
+  labs(x = "Treatment",
+  y = "log2(relative abundance)",
+  title = "")
+
+```
+
+## Testing assumptions
+
+### Normality
+
+
+```{r}
+# testing normality by group
+compound_C %>%
+  drop_na(rel_abund) %>% # remove NAs
+  group_by(id) %>% # test by species
+  shapiro_test(rel_abund) # test for normality
+```
+### Constant variance
+
+```{r}
+# testing constant variance
+
+compound_C %>%
+  drop_na(rel_abund) %>% # remove NAs
+  levene_test(rel_abund ~ id) # test for constant variance
+```
+
+
+```{r}
+compound_C %>%
+  drop_na(rel_abund) %>%
+  ggplot(aes(x = rel_abund, y = id, fill = id)) +
+  ggridges::geom_density_ridges(alpha = 0.5) +
+  # scale_y_discrete(labels = c( "Coumaroyl quinic acid", "Feruloylquinic acid", "Quercetin-3-glucoside", "Sinapic acid", "5-Caffeoylquinic acid", "Naringin")) +
+  theme_minimal() +  
+  theme(legend.position = "none") +
+  labs(x = "Relative abundance",
+       y = "Compound",
+       title = "Distribution of relative abundace for some compounds in blended juice")
+```
+
+## Nonparametric tests
+
+### kruskal Wallis test
+
+```{r}
+kruskal_compound_C <- compound_C %>%
+  drop_na(rel_abund, treatment) %>%            # Remove NA values first
+  group_by(id) %>%                             # Group by 'id'
+  kruskal_test(rel_abund ~ treatment) %>%      # Apply the Kruskal-Wallis test
+  add_significance() %>%     
+  arrange(p)     
+           
+kruskal_compound_C
+```
+
+### Post-hoc test
+
+Run Dunn test
+
+```{r}
+(kruskal_compound_C_posthoc <- compound_C %>%
+      drop_na(rel_abund, treatment) %>%        # Remove NA values first
+      group_by(id) %>%                         # Group by 'id'
+      dunn_test(rel_abund ~ treatment,
+                p.adjust.method = "BH"))
+```
+
+```{r}
+# Create a column called comparison
+
+kruskal_compound_C_posthocc_1 <- kruskal_compound_C_posthoc %>%
+  mutate(comparison = glue("{group1} - {group2}")) 
+  
+# Group data by 'id' and create a nested data frame
+group_cldList <- kruskal_compound_C_posthocc_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(p.adj ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+# Display the result
+group_cldList <- group_cldList %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+  
+```
+
+
+Make a table that has the maximum relative abundance for each treatment.
+
+```{r}
+# Calculate maximum rel_abund for each id and treatment
+max_relabund <- compound_C %>%
+  drop_na(rel_abund, treatment) %>%  # Remove NA values
+  group_by(id, treatment) %>%        # Group by 'id' and 'treatment'
+  summarize(max_tot_relabund = max(rel_abund, na.rm = TRUE)) %>%  # Calculate max
+  ungroup()  # Remove grouping
+
+# Display the result
+max_relabund
+```
+
+
+Bind the groups to the maximum relative abundance.
+
+```{r}
+dunn_compound_C_for_plotting <- max_relabund %>%
+  left_join(group_cldList, by = c("id", "treatment"))
+
+```
+
+Plot
+
+```{r}
+boxplot_dunn <- boxplot_compound_C +
+  geom_text(data = dunn_compound_C_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = dunn_compound_C_for_plotting$Letter)) +
+  labs(caption = "For each compound, treatmnets with different letters are significant different unsing Krushal Wallis test")
+
+boxplot_dunn 
+```
+
+
+## Parametric tests
+
+### ANOVA test
+
+```{r}
+# Prepare your data 
+clean_data <- compound_C %>%
+  drop_na(rel_abund, treatment) %>%
+  group_by(id) %>%
+  nest()  # Nest data for each 'id'
+
+# Apply ANOVA to each nested data frame
+results <- clean_data %>%
+  mutate(
+    anova_model = map(data, ~ aov(rel_abund ~ treatment, data = .x)),
+    anova_summary = map(anova_model, tidy)  # Use broom::tidy to summarize ANOVA results
+  )
+
+# Print results for each id
+results %>%
+  select(id, anova_summary) %>%
+  unnest(anova_summary) %>%
+  print()
+
+# To perform Tukey HSD test and print results
+results <- results %>%
+  mutate(
+    tukey_test = map(anova_model, TukeyHSD),
+    tukey_summary = map(tukey_test, tidy)  # Use broom::tidy to summarize Tukey HSD results
+  )
+
+# Print Tukey HSD results
+table_results <- results %>%
+  select(id, tukey_summary) %>%
+  unnest(tukey_summary) %>%
+  arrange(adj.p.value)%>%
+  print()
+```
+
+```{r}
+# Create a column called comparison
+
+table_results_1 <- table_results %>%
+rename(comparison = `contrast`)
+
+# Group data by 'id' and create a nested data frame
+group_cldList_2 <- table_results_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(adj.p.value ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+
+# Display the result
+group_cldList_2 <- group_cldList_2 %>%
+  rename(treatment = Group) 
+  
+# mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+
+```
+
+Join the groups to the maximum relative abundance.
+
+```{r}
+tukey_compound_C_for_plotting <- max_relabund %>%
+  left_join(group_cldList_2, by = c("id", "treatment"))
+```
+
+```{r}
+Boxplot_tukey_compound_C <- boxplot_compound_C +
+  geom_text(data = tukey_compound_C_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = Letter)) +
+  labs(title = "", tag = "B")
+
+Boxplot_tukey_compound_C
+
+```
+
+
+```{r}
+ggsave(plot = Boxplot_tukey_compound_C,
+       filename = "boxplot_compound_C_neg.svg")
+```
+
+# Compariosn between compounds E
+
+ 
+ 
+## Boxplots
+
+Filter to select the compound you want to plot.
+
+```{r}
+compound_E <- feature_table_long_log2 %>%
+  filter(id == "3,4-Dihydroxybenzoic acid" | id == "2,4,6-Trihydroxybenzoic acid" | id == "Glucose" | id == "2,4,6-Tryhydroxybenzaldehyde") %>%
+   filter(sample_or_qc == "Sample")
+
+```
+
+
+Then plot.
+
+```{r}
+boxplot_compound_E <- compound_E %>%
+  ggplot(aes(x = factor(treatment, levels = c("FJ", "MT", "MEF", "MEF+SS")), 
+             y = rel_abund, fill = treatment)) +
+  geom_boxplot(color = "black", alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(height = 0, width = 0.3) +
+  facet_wrap(vars(id), nrow = 2, scales = "free_y") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("FJ" = "#F28EAD", 
+                                "MT" = "#C77CDB",
+                                "MEF" = "#A8D8B9", 
+                                "MEF+SS" = "#7FB3D5")) +
+  labs(x = "Treatment",
+  y = "log2(relative abundance)",
+  title = "")
+
+boxplot_compound_E
+
+```
+
+## Testing assumptions
+
+### Normality
+
+
+```{r}
+# testing normality by group
+compound_E %>%
+  drop_na(rel_abund) %>% # remove NAs
+  group_by(id) %>% # test by species
+  shapiro_test(rel_abund) # test for normality
+```
+### Constant variance
+
+```{r}
+# testing constant variance
+
+compound_E %>%
+  drop_na(rel_abund) %>% # remove NAs
+  levene_test(rel_abund ~ id) # test for constant variance
+```
+
+
+```{r}
+compound_E %>%
+  drop_na(rel_abund) %>%
+  ggplot(aes(x = rel_abund, y = id, fill = id)) +
+  ggridges::geom_density_ridges(alpha = 0.7) +
+  # scale_y_discrete(labels = c("3,4-Dihydroxybenzoic acid", "2,4,6-Trihydroxybenzoic acid", "Glucose", "2,4,6-Trihydroxybenzaldehyde")) +
+  theme_minimal() +  
+  theme(legend.position = "none") +
+  labs(x = "Relative abundance",
+       y = "Compound",
+       title = "Distribution of relative abundace for some compounds in blended juice")
+```
+ 
+
+## Nonparametric tests
+
+### kruskal Wallis test
+
+```{r}
+kruskal_compound_E <- compound_C %>%
+  drop_na(rel_abund, treatment) %>%            # Remove NA values first
+  group_by(id) %>%                             # Group by 'id'
+  kruskal_test(rel_abund ~ treatment) %>%      # Apply the Kruskal-Wallis test
+  add_significance() %>%     
+  arrange(p)     
+           
+kruskal_compound_E
+```
+
+### Post-hoc test
+
+Run Dunn test
+
+```{r}
+(kruskal_compound_E_posthoc <- compound_E %>%
+      drop_na(rel_abund, treatment) %>%        # Remove NA values first
+      group_by(id) %>%                         # Group by 'id'
+      dunn_test(rel_abund ~ treatment,
+                p.adjust.method = "BH"))
+```
+
+```{r}
+# Create a column called comparison
+
+kruskal_compound_E_posthocc_1 <- kruskal_compound_E_posthoc %>%
+  mutate(comparison = glue("{group1} - {group2}")) 
+  
+# Group data by 'id' and create a nested data frame
+group_cldList <- kruskal_compound_C_posthocc_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(p.adj ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+# Display the result
+group_cldList <- group_cldList %>%
+  rename(treatment = Group) 
+
+ # mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+  
+```
+
+
+Make a table that has the maximum relative abundance for each treatment.
+
+```{r}
+# Calculate maximum rel_abund for each id and treatment
+max_relabund <- compound_E %>%
+  drop_na(rel_abund, treatment) %>%  # Remove NA values
+  group_by(id, treatment) %>%        # Group by 'id' and 'treatment'
+  summarize(max_tot_relabund = max(rel_abund, na.rm = TRUE)) %>%  # Calculate max
+  ungroup()  # Remove grouping
+
+# Display the result
+max_relabund
+```
+
+Bind the groups to the maximum relative abundance.
+
+```{r}
+dunn_compound_E_for_plotting <- max_relabund %>%
+  left_join(group_cldList, by = c("id", "treatment"))
+
+```
+
+Plot
+
+```{r}
+boxplot_dunn <- boxplot_compound_E +
+  geom_text(data = dunn_compound_E_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = dunn_compound_E_for_plotting$Letter)) +
+  labs(caption = "For each compound, treatmnets with different letters are significant different unsing Krushal Wallis test")
+
+boxplot_dunn 
+```
+
+
+## Parametric tests
+
+### ANOVA test
+
+```{r}
+# Prepare your data 
+clean_data <- compound_E %>%
+  drop_na(rel_abund, treatment) %>%
+  group_by(id) %>%
+  nest()  # Nest data for each 'id'
+
+# Apply ANOVA to each nested data frame
+results <- clean_data %>%
+  mutate(
+    anova_model = map(data, ~ aov(rel_abund ~ treatment, data = .x)),
+    anova_summary = map(anova_model, tidy)  # Use broom::tidy to summarize ANOVA results
+  )
+
+# Print results for each id
+results %>%
+  select(id, anova_summary) %>%
+  unnest(anova_summary) %>%
+  print()
+
+# To perform Tukey HSD test and print results
+results <- results %>%
+  mutate(
+    tukey_test = map(anova_model, TukeyHSD),
+    tukey_summary = map(tukey_test, tidy)  # Use broom::tidy to summarize Tukey HSD results
+  )
+
+# Print Tukey HSD results
+table_results <- results %>%
+  select(id, tukey_summary) %>%
+  unnest(tukey_summary) %>%
+  arrange(adj.p.value)%>%
+  print()
+```
+
+```{r}
+# Create a column called comparison
+
+table_results_1 <- table_results %>%
+rename(comparison = `contrast`)
+
+# Group data by 'id' and create a nested data frame
+group_cldList_2 <- table_results_1 %>%
+  group_by(id) %>%
+  nest() %>%  # Nest data for each 'id'
+  
+# Apply cldList function on each nested data
+mutate(cld_results = map(data, ~ cldList(adj.p.value ~ comparison, data = .x, threshold = 0.05))) %>%
+ unnest(cld_results) %>%  # Unnest the results
+  select(-data) %>%       # Remove the nested column and ungroup the result
+  ungroup()
+
+
+# Display the result
+group_cldList_2 <- group_cldList_2 %>%
+  rename(treatment = Group) 
+
+#  mutate(treatment = str_replace(treatment, "FreshJuice", "Fresh Juice"))
+
+```
+
+Join the groups to the maximum relative abundance.
+
+```{r}
+tukey_compound_E_for_plotting <- max_relabund %>%
+  left_join(group_cldList_2, by = c("id", "treatment"))
+```
+
+```{r}
+Boxplot_tukey_compound_E <- boxplot_compound_E +
+  geom_text(data = tukey_compound_E_for_plotting,
+            aes(x = treatment,
+                y = max_tot_relabund + 0.5,
+                label = Letter)) +
+  labs(caption = "Line represents the median abundance per treatment. 
+       For each compound, treatmnets with different letters are significant different using Tukey's test",   
+       title = "", tag = "E")
+
+Boxplot_tukey_compound_E
+
+```
+
+
+```{r}
+ggsave(plot = Boxplot_tukey_compound_E,
+       filename = "boxplot_compound_E_neg.svg")
+```
+
